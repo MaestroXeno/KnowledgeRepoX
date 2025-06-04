@@ -1,0 +1,237 @@
+### 1. **Inefficient Database Queries (N+1 Problem)**
+**Location**: Multiple model files (`models.py`) and views  
+**Problem**:  
+- Lack of `select_related`/`prefetch_related` in ORM queries causing N+1 query issues
+- See `powerbot/whatsapp/views.py` and `teamuser/views.py`
+
+**Fix**:  
+```python
+# Before
+messages = WhatsAppTwoWayCommunication.objects.filter(bot_id=bot_id)
+
+# After (add select_related)
+messages = WhatsAppTwoWayCommunication.objects.select_related('lead').filter(bot_id=bot_id)
+```
+
+### 2. **Large File Handling Bottleneck**
+**Location**: `powerbot/whatsapp/models.py` (canned messages/media uploads)  
+**Problem**:  
+- Whole file loaded into memory (`models.FileField`/`models.ImageField`)
+- Causes high memory usage for large uploads
+
+**Fix**:  
+**Use Django's File Handling Best Practices**:
+```python
+# settings.py
+DEFAULT_FILE_STORAGE = 'storages.backends.azure_storage.AzureStorage'
+AZURE_OVERWRITE_FILES = False
+AZURE_LOCATION = 'media'
+```
+
+### 3. **Blocking I/O Operations**
+**Location**: `powerbot/whatsapp/utils.py`  
+**Problem**:  
+- Synchronous API calls to external services (WhatsApp/Meta APIs)
+- Blocks Django worker threads during network requests
+
+**Fix**:  
+**Use Celery for Async Tasks**:
+```python
+# tasks.py (new)
+from celery import shared_task
+
+@shared_task
+def send_whatsapp_message_async(phone, message):
+    # API call logic here
+```
+
+### 4. **Poor Static File Configuration**
+**Location**: `settings.py` (not in ZIP but inferred)  
+**Problem**:  
+- Serving static/media files via Django in production
+- High CPU usage and slow response times
+
+**Fix**:  
+**Configure Azure Storage**:
+```python
+# settings.py
+STATICFILES_STORAGE = 'custom.azure.AzureStaticStorage'
+DEFAULT_FILE_STORAGE = 'custom.azure.AzureMediaStorage'
+
+AZURE_ACCOUNT_NAME = os.getenv('AZURE_ACCOUNT_NAME')
+AZURE_ACCOUNT_KEY = os.getenv('AZURE_ACCOUNT_KEY')
+AZURE_CUSTOM_DOMAIN = f'{AZURE_ACCOUNT_NAME}.blob.core.windows.net'
+```
+
+### 5. **Inefficient Migration History**
+**Location**: All migrations directories  
+**Problem**:  
+- 45+ migration files per app (e.g., `user_auth/migrations/00*`)
+- Slow startup and test execution
+
+**Fix**:  
+**Squash Migrations**:
+```bash
+# Squash migrations for problematic apps
+python manage.py squashmigrations user_auth 0050
+python manage.py squashmigrations whatsapp 0049
+```
+
+### 6. **Hardcoded Secrets**
+**Location**: `powerbot/admin_page/models.py`  
+**Problem**:  
+- AWS credentials stored in plain text in models:
+```python
+class WhatsappDemoCreds(models.Model):
+    aws_access_key = models.CharField(max_length=255)
+    aws_secret_access_key = models.CharField(max_length=255)
+```
+
+**Fix**:  
+**Use Azure Key Vault**:
+```python
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+credential = DefaultAzureCredential()
+client = SecretClient(vault_url=KEYVAULT_URL, credential=credential)
+
+def get_secret(name):
+    return client.get_secret(name).value
+```
+
+### 7. **Redundant Template Loading**
+**Location**: Multiple `templates/` directories  
+**Problem**:  
+- Duplicate templates across apps (e.g., 5+ `registration_*.html` files)
+- Inconsistent design and maintenance overhead
+
+**Fix**:  
+**Consolidate Templates**:
+```
+templates/
+└── registration/
+    ├── base.html
+    ├── invited.html
+    └── form.html
+```
+Update views to use `registration/invited.html`
+
+### 8. **Database Index Missing**
+**Location**: Model definitions (without `db_index=True`)  
+**Problem**:  
+- Frequent filter fields lack database indexes
+- Visible in model files like `whatsapp/models.py`:
+```python
+class WhatsAppTwoWayCommunication(models.Model):
+    lead_whatsapp_no = models.CharField(max_length=20)  # No index
+```
+
+**Fix**:  
+**Add Critical Indexes**:
+```python
+lead_whatsapp_no = models.CharField(max_length=20, db_index=True)
+created_on = models.DateTimeField(auto_now_add=True, db_index=True)
+```
+
+### 9. **Large Memory Use in Views**
+**Location**: `powerbot/analytics/views.py`  
+**Problem**:  
+- Loading entire querysets into memory (`list(queryset)`)
+- Parser-heavy operations on large datasets
+
+**Fix**:  
+**Use Pagination and Streaming**:
+```python
+from django.core.paginator import Paginator
+
+def analytics_view(request):
+    page = request.GET.get('page', 1)
+    paginator = Paginator(large_queryset, 100)
+    return render(request, 'template.html', {'data': paginator.page(page)})
+```
+
+### 10. **CI/CD Improper Caching**
+**Location**: `.github/workflows/main.yml`  
+**Problem**:  
+- No dependency caching in CI/CD pipeline
+- Slow test execution due to repeated installs
+
+**Fix**:  
+**Add Cache Step**:
+```yaml
+steps:
+- name: Cache pip
+  uses: actions/cache@v3
+  with:
+    path: ~/.cache/pip
+    key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+```
+
+### 11. Ignore `.venv` Directory (Git Issue)  
+Problem:  
+- Virtual environment directory committed to Git
+
+Fix:  
+Add to `.gitignore`:  
+```
+.venv/
+ENV/
+```
+
+---
+
+## Critical Path Optimization Summary
+
+1. **ASGI Implementation** (replace WSGI):
+   ```python
+   # core/asgi.py
+   from django.core.asgi import get_asgi_application
+   from channels.routing import ProtocolTypeRouter, URLRouter
+   
+   application = ProtocolTypeRouter({
+       "http": get_asgi_application(),
+       "websocket": URLRouter(my_websocket_routes),
+   })
+   ```
+
+2. **DB Connection Pooling**:
+   ```python
+   # settings.py
+   DATABASES = {
+       'default': {
+           'ENGINE': 'django_db_geventpool.backends.postgresql_psycopg2',
+           'CONN_MAX_AGE': 0,
+           'OPTIONS': {
+               'MAX_CONNS': 20,
+           }
+       }
+   }
+   ```
+
+3. **Cache Template Loader**:
+   ```python
+   TEMPLATES = [{
+       'BACKEND': 'django.template.backends.django.DjangoTemplates',
+       'OPTIONS': {
+           'loaders': [
+               ('django.template.loaders.cached.Loader', [
+                   'django.template.loaders.filesystem.Loader',
+                   'django.template.loaders.app_directories.Loader',
+               ]),
+           ],
+       },
+   }]
+   ```
+
+---
+
+These changes address:  
+-  Database efficiency  
+-  Memory management  
+-  I/O bottlenecks  
+-  Deployment performance  
+-  Security vulnerabilities  
+-  Maintenance overhead
+
+The most critical fixes are the database optimizations (N+1, indexing) and moving to async operations for external API calls, which will provide immediate performance improvements under load.
